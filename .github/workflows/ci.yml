@@ -5,13 +5,18 @@ name: CI
 # contexts are available here. Deliberately no fromJSON(): `inputs` is null on
 # non-dispatch events, and whether `&&`/`||` short-circuit is undocumented, so
 # an untaken branch calling fromJSON('') could error out the whole expression.
+#
+# Commit-message properties are avoided for the same reason a subject line
+# cannot be extracted: expressions have no split or substring function, so a
+# multi-line message renders its entire body into the run title. The head SHA
+# is the single-line stand-in.
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch'
       && format('SQ · {0} · speculative batch (run {1})', inputs.sq_queue, github.run_number)
    || github.event_name == 'merge_group'
-      && format('MQ · {0}', github.event.merge_group.head_commit.message)
+      && format('MQ · {0}', github.event.merge_group.head_sha)
    || github.event_name == 'push'
-      && format('Main · {0}', github.event.head_commit.message)
+      && format('Main · {0}', github.event.head_commit.id)
    || format('PR #{0} · {1}', github.event.pull_request.number, github.event.pull_request.title) }}
 
 on:
@@ -24,12 +29,15 @@ on:
       sq_head_uris:
         description: "JSON array of change URIs in the batch under test"
         required: false
+        default: "[]"
       sq_base_uris:
         description: "JSON array of in-flight change URIs this batch speculates on top of"
         required: false
+        default: "[]"
       sq_queue:
         description: "SubmitQueue queue name"
         required: false
+        default: "unspecified"
       sq_metadata:
         description: "Caller-supplied build metadata, as JSON"
         required: false
