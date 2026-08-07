@@ -3,6 +3,20 @@ name: CI
 on:
   pull_request:
   merge_group:
+  workflow_dispatch:
+    inputs:
+      sq_head_uris:
+        description: "JSON array of change URIs in the batch under test"
+        required: false
+      sq_base_uris:
+        description: "JSON array of in-flight change URIs this batch speculates on top of"
+        required: false
+      sq_queue:
+        description: "SubmitQueue queue name"
+        required: false
+      sq_metadata:
+        description: "Caller-supplied build metadata, as JSON"
+        required: false
 
 # Cancel superseded runs on a PR, but never cancel a merge queue run —
 # the queue needs the check to complete to decide merge/eject.
