@@ -19,9 +19,11 @@ on:
         required: false
 
 # Cancel superseded runs on a PR, but never cancel a merge queue run —
-# the queue needs the check to complete to decide merge/eject.
+# the queue needs the check to complete to decide merge/eject. Dispatch runs
+# get a group of their own (run_id) so concurrent speculative batches from
+# SubmitQueue neither cancel nor serialize behind each other.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -59,16 +61,210 @@ jobs:
       - name: Test
         run: echo "no-op test — nothing to run yet"
 
+  # Reconstructs what SubmitQueue is actually asking CI to test: the base URIs
+  # are in-flight changes ahead of this batch in the queue (speculated on, not
+  # yet merged), the head URIs are the batch under test. Building both refs and
+  # diffing them shows exactly the change this run is responsible for.
+  speculate:
+    name: Speculate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      # Every dispatch input is caller-supplied, so it is passed through env
+      # rather than interpolated into the script body — a `${{ }}` expansion
+      # inside `run:` would let a crafted value inject shell.
+      - name: Parse inputs
+        env:
+          SQ_QUEUE: ${{ inputs.sq_queue }}
+          SQ_BASE_URIS: ${{ inputs.sq_base_uris }}
+          SQ_HEAD_URIS: ${{ inputs.sq_head_uris }}
+          SQ_METADATA: ${{ inputs.sq_metadata }}
+        run: |
+          set -euo pipefail
+
+          echo "queue    : ${SQ_QUEUE:-<none>}"
+          echo "repo     : $GITHUB_REPOSITORY"
+          echo "main tip : $(git rev-parse HEAD)"
+          echo "metadata :"
+          if [ -n "${SQ_METADATA:-}" ]; then
+            echo "$SQ_METADATA" | jq . || { echo "  (not valid JSON, logging raw)"; echo "  $SQ_METADATA"; }
+          else
+            echo "  <none>"
+          fi
+
+          # github://{host[:port]}/{owner}/{repo}/pull/{pr_number}/{head_commit_sha}
+          # Owner may contain slashes, so it is matched greedily and the segment
+          # immediately before "pull" is the repo. SHA is a full 40-char
+          # lowercase hex, matching SubmitQueue's own validation.
+          parse() {
+            local label="$1" json="${2:-}" out="$3"
+            : > "$out"
+            [ -z "$json" ] && json='[]'
+            if ! echo "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+              echo "::error::sq_${label}_uris is not a JSON array: $json"
+              exit 1
+            fi
+            local re='^github://([^/]+)/(.+)/([^/]+)/pull/([0-9]+)/([0-9a-f]{40})$'
+            local n=0
+            while IFS= read -r uri; do
+              [ -z "$uri" ] && continue
+              if [[ ! "$uri" =~ $re ]]; then
+                echo "::error::malformed change URI: $uri"
+                echo "::error::expected github://{host}/{owner}/{repo}/pull/{pr}/{40-hex-sha}"
+                exit 1
+              fi
+              printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$uri" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+                "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" >> "$out"
+              n=$((n + 1))
+              echo "  [$label $n] ${BASH_REMATCH[2]}/${BASH_REMATCH[3]}#${BASH_REMATCH[4]} @ ${BASH_REMATCH[5]:0:12} (host ${BASH_REMATCH[1]})"
+            done < <(echo "$json" | jq -r '.[]')
+            echo "$label URIs: $n"
+          }
+
+          echo "--- base (in-flight, speculated on) ---"
+          parse base "${SQ_BASE_URIS:-}" "$RUNNER_TEMP/base.tsv"
+          echo "--- head (batch under test) ---"
+          parse head "${SQ_HEAD_URIS:-}" "$RUNNER_TEMP/head.tsv"
+
+      - name: Write apply helper
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/apply.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # apply.sh <tsv> <label> — cherry-picks each change onto HEAD, in order.
+          # Mirrors SubmitQueue's REBASE strategy: fetch the PR head from
+          # refs/pull/<n>/head (published for forks too) and replay it onto the
+          # target tip.
+          set -euo pipefail
+          tsv="$1"; label="$2"
+          [ -s "$tsv" ] || { echo "no $label URIs — nothing to apply"; exit 0; }
+
+          while IFS=$'\t' read -r uri host owner repo pr sha; do
+            echo "::group::$label: $owner/$repo#$pr @ ${sha:0:12}"
+            echo "uri : $uri"
+
+            if [ "$owner/$repo" != "$GITHUB_REPOSITORY" ]; then
+              echo "::error::cross-repo change ($owner/$repo != $GITHUB_REPOSITORY); this demo applies same-repo changes only"
+              exit 1
+            fi
+
+            git fetch --no-tags --quiet origin "refs/pull/$pr/head"
+            tip="$(git rev-parse FETCH_HEAD)"
+            echo "refs/pull/$pr/head -> $tip"
+            if [ "$tip" != "$sha" ]; then
+              echo "::warning::stale URI: pins $sha but PR head is now $tip"
+            fi
+
+            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --quiet origin "$sha" 2>/dev/null || {
+                echo "::error::pinned commit $sha is not available (force-pushed away?)"
+                exit 1
+              }
+            fi
+
+            base="$(git merge-base HEAD "$sha")"
+            count="$(git rev-list --count "$base..$sha")"
+            echo "replaying $count commit(s) from $(git rev-parse --short "$base")..${sha:0:12}"
+
+            if ! git cherry-pick --allow-empty --keep-redundant-commits "$base..$sha"; then
+              echo "::error::conflict applying $owner/$repo#$pr onto $(git rev-parse --short HEAD)"
+              git cherry-pick --abort || true
+              exit 1
+            fi
+
+            echo "HEAD now $(git rev-parse HEAD)"
+            echo "::endgroup::"
+          done < "$tsv"
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/apply.sh"
+
+          git config user.name  "sq-ci[bot]"
+          git config user.email "sq-ci[bot]@users.noreply.github.com"
+
+      - name: Build base ref
+        run: |
+          set -euo pipefail
+          git switch --quiet --create sq/base
+          echo "sq/base starts at $(git rev-parse HEAD) (default branch tip)"
+          "$RUNNER_TEMP/apply.sh" "$RUNNER_TEMP/base.tsv" base
+          echo "sq/base = $(git rev-parse HEAD)"
+
+      - name: Build head ref
+        run: |
+          set -euo pipefail
+          git switch --quiet --create sq/head sq/base
+          echo "sq/head starts at $(git rev-parse HEAD) (= sq/base)"
+          "$RUNNER_TEMP/apply.sh" "$RUNNER_TEMP/head.tsv" head
+          echo "sq/head = $(git rev-parse HEAD)"
+
+      - name: Diff base..head
+        run: |
+          set -euo pipefail
+
+          base_sha="$(git rev-parse sq/base)"
+          head_sha="$(git rev-parse sq/head)"
+
+          echo "=============================================="
+          echo " sq/base : $base_sha"
+          echo " sq/head : $head_sha"
+          echo "=============================================="
+
+          if [ "$base_sha" = "$head_sha" ]; then
+            echo "no head URIs applied — base and head are identical, empty diff"
+          fi
+
+          echo "--- commits in head, not in base ---"
+          git --no-pager log --oneline --no-decorate sq/base..sq/head || true
+
+          echo "--- diffstat ---"
+          git --no-pager diff --stat sq/base..sq/head || true
+
+          echo "--- diff ---"
+          git --no-pager diff sq/base..sq/head || true
+
+          {
+            echo "### Speculation result"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| queue | \`${SQ_QUEUE:-<none>}\` |"
+            echo "| sq/base | \`$base_sha\` |"
+            echo "| sq/head | \`$head_sha\` |"
+            echo
+            echo "#### Commits under test"
+            echo '```'
+            git --no-pager log --oneline --no-decorate sq/base..sq/head || true
+            echo '```'
+            echo
+            echo "#### Diffstat"
+            echo '```'
+            git --no-pager diff --stat sq/base..sq/head || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          SQ_QUEUE: ${{ inputs.sq_queue }}
+
+      - name: Verify
+        run: echo "no-op verify — the batch built cleanly, nothing to assert yet"
+
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [build, test]
+    needs: [build, test, speculate]
     if: always()
     steps:
       - name: Report
         run: |
-          echo "build: ${{ needs.build.result }}"
-          echo "test : ${{ needs.test.result }}"
+          echo "build     : ${{ needs.build.result }}"
+          echo "test      : ${{ needs.test.result }}"
+          echo "speculate : ${{ needs.speculate.result }}"
           if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
             echo "CI failed"
             exit 1
