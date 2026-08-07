@@ -1,8 +1,24 @@
 name: CI
 
+# Distinguishes the four ways this workflow runs, since they are otherwise
+# indistinguishable in the Actions list. Only the `github` and `inputs`
+# contexts are available here. Deliberately no fromJSON(): `inputs` is null on
+# non-dispatch events, and whether `&&`/`||` short-circuit is undocumented, so
+# an untaken branch calling fromJSON('') could error out the whole expression.
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('SQ · {0} · speculative batch (run {1})', inputs.sq_queue, github.run_number)
+   || github.event_name == 'merge_group'
+      && format('MQ · {0}', github.event.merge_group.head_commit.message)
+   || github.event_name == 'push'
+      && format('Main · {0}', github.event.head_commit.message)
+   || format('PR #{0} · {1}', github.event.pull_request.number, github.event.pull_request.title) }}
+
 on:
   pull_request:
   merge_group:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       sq_head_uris:
@@ -37,15 +53,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Branch names reach these values verbatim, and a PR head ref is
+      # attacker-controlled, so they go through env rather than being
+      # interpolated into the script body.
       - name: Context
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          ACTOR: ${{ github.actor }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          echo "event      : ${{ github.event_name }}"
-          echo "ref        : ${{ github.ref }}"
-          echo "sha        : ${{ github.sha }}"
-          echo "base ref   : ${{ github.base_ref }}"
-          echo "head ref   : ${{ github.head_ref }}"
-          echo "actor      : ${{ github.actor }}"
-          echo "run attempt: ${{ github.run_attempt }}"
+          echo "event      : $EVENT"
+          echo "ref        : $REF"
+          echo "sha        : $SHA"
+          echo "base ref   : ${BASE_REF:-<none>}"
+          echo "head ref   : ${HEAD_REF:-<none>}"
+          echo "actor      : $ACTOR"
+          echo "run attempt: $RUN_ATTEMPT"
 
       - name: Build
         run: echo "no-op build — nothing to compile yet"
