@@ -53,12 +53,31 @@ concurrency:
 permissions:
   contents: read
 
+# A single job on purpose. Every step here is cheap, so splitting them across
+# jobs meant paying a fresh runner allocation (~7s of setup, checkout and
+# teardown) per job for work measured in milliseconds — and paying it three
+# times over, since build -> test -> gate was a serial chain. One job also
+# means one status check to report and no `needs.*.result` aggregation: a
+# failing step fails the job, which fails the check.
+#
+# Keep the job name `CI`. It is the check name SubmitQueue polls.
 jobs:
-  build:
-    name: Build
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
+      # Speculation replays changes onto the default branch, and needs full
+      # history for the merge-base walk in apply.sh.
+      - name: Checkout (speculation base)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      # Every other event tests its own ref.
       - name: Checkout
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v4
 
       # Branch names reach these values verbatim, and a PR head ref is
@@ -82,39 +101,20 @@ jobs:
           echo "actor      : $ACTOR"
           echo "run attempt: $RUN_ATTEMPT"
 
-      - name: Build
-        run: echo "no-op build — nothing to compile yet"
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Test
-        run: echo "no-op test — nothing to run yet"
-
-  # Reconstructs what SubmitQueue is actually asking CI to test: the base URIs
-  # are in-flight changes ahead of this batch in the queue (speculated on, not
-  # yet merged), the head URIs are the batch under test. Building both refs and
-  # diffing them shows exactly the change this run is responsible for.
-  speculate:
-    name: Speculate
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
+      # --- speculation (workflow_dispatch only) -------------------------------
+      #
+      # Reconstructs what SubmitQueue is actually asking CI to test: the base
+      # URIs are in-flight changes ahead of this batch in the queue (speculated
+      # on, not yet merged), the head URIs are the batch under test. Building
+      # both refs and diffing them shows exactly the change this run is
+      # responsible for. Build and test below then run against the constructed
+      # sq/head tree.
 
       # Every dispatch input is caller-supplied, so it is passed through env
       # rather than interpolated into the script body — a `${{ }}` expansion
       # inside `run:` would let a crafted value inject shell.
       - name: Parse inputs
+        if: github.event_name == 'workflow_dispatch'
         env:
           SQ_QUEUE: ${{ inputs.sq_queue }}
           SQ_BASE_URIS: ${{ inputs.sq_base_uris }}
@@ -169,6 +169,7 @@ jobs:
           parse head "${SQ_HEAD_URIS:-}" "$RUNNER_TEMP/head.tsv"
 
       - name: Write apply helper
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/apply.sh" <<'SCRIPT'
@@ -224,6 +225,7 @@ jobs:
           git config user.email "sq-ci[bot]@users.noreply.github.com"
 
       - name: Build base ref
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           git switch --quiet --create sq/base
@@ -232,6 +234,7 @@ jobs:
           echo "sq/base = $(git rev-parse HEAD)"
 
       - name: Build head ref
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           git switch --quiet --create sq/head sq/base
@@ -240,6 +243,9 @@ jobs:
           echo "sq/head = $(git rev-parse HEAD)"
 
       - name: Diff base..head
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SQ_QUEUE: ${{ inputs.sq_queue }}
         run: |
           set -euo pipefail
 
@@ -283,25 +289,17 @@ jobs:
             git --no-pager diff --stat sq/base..sq/head || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-        env:
-          SQ_QUEUE: ${{ inputs.sq_queue }}
 
-      - name: Verify
-        run: echo "no-op verify — the batch built cleanly, nothing to assert yet"
+      # --- build and test -----------------------------------------------------
+      #
+      # On a dispatch run the working tree is sq/head, so these exercise the
+      # speculated batch rather than the bare default branch.
 
-  ci:
-    name: CI
-    runs-on: ubuntu-latest
-    needs: [build, test, speculate]
-    if: always()
-    steps:
+      - name: Build
+        run: echo "no-op build — nothing to compile yet"
+
+      - name: Test
+        run: echo "no-op test — nothing to run yet"
+
       - name: Report
-        run: |
-          echo "build     : ${{ needs.build.result }}"
-          echo "test      : ${{ needs.test.result }}"
-          echo "speculate : ${{ needs.speculate.result }}"
-          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
-            echo "CI failed"
-            exit 1
-          fi
-          echo "CI passed"
+        run: echo "CI passed"
