@@ -1,29 +1,17 @@
 name: CI
 
-# Distinguishes the four ways this workflow runs, since they are otherwise
-# indistinguishable in the Actions list. Only the `github` and `inputs`
-# contexts are available here. Deliberately no fromJSON(): `inputs` is null on
-# non-dispatch events, and whether `&&`/`||` short-circuit is undocumented, so
-# an untaken branch calling fromJSON('') could error out the whole expression.
-#
-# Commit-message properties are avoided for the same reason a subject line
-# cannot be extracted: expressions have no split or substring function, so a
-# multi-line message renders its entire body into the run title. The head SHA
-# is the single-line stand-in.
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch'
-      && format('SQ - {0} - speculative batch (run {1})', inputs.sq_queue, github.run_number)
-   || github.event_name == 'merge_group'
-      && format('MQ - {0}', github.event.merge_group.head_sha)
-   || github.event_name == 'push'
-      && format('Main - {0}', github.event.head_commit.id)
-   || format('PR #{0} - {1}', github.event.pull_request.number, github.event.pull_request.title) }}
+run-name: SQ - ${{ inputs.sq_queue }} - speculative batch (run ${{ github.run_number }})
 
+# SubmitQueue is the only thing that runs this workflow. It dispatches a run
+# per speculative batch and polls the resulting `CI` check to decide
+# merge/eject, so a PR gets its signal from the queue rather than from its own
+# push. `pull_request` was removed for that reason — it accounted for roughly
+# half of all runs and duplicated what the queue already tests. `merge_group`
+# went with it: SubmitQueue is the queue, GitHub's native one is not in use and
+# the trigger had never once fired. `push` on main is gone too, so there is no
+# post-merge signal — a batch that merges something broken will not be caught
+# here.
 on:
-  pull_request:
-  merge_group:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       sq_head_uris:
@@ -42,13 +30,10 @@ on:
         description: "Caller-supplied build metadata, as JSON"
         required: false
 
-# Cancel superseded runs on a PR, but never cancel a merge queue run —
-# the queue needs the check to complete to decide merge/eject. Dispatch runs
-# get a group of their own (run_id) so concurrent speculative batches from
-# SubmitQueue neither cancel nor serialize behind each other.
-concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Deliberately no `concurrency:` block. Speculative batches are independent and
+# must never cancel or serialize behind one another — the queue needs every
+# dispatched run to complete so it can decide merge/eject. Adding a group that
+# several batches can share would break that.
 
 permissions:
   contents: read
@@ -68,53 +53,35 @@ jobs:
     steps:
       # Speculation replays changes onto the default branch, and needs full
       # history for the merge-base walk in apply.sh.
-      - name: Checkout (speculation base)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      # Every other event tests its own ref.
-      - name: Checkout
-        if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
-
-      # Branch names reach these values verbatim, and a PR head ref is
-      # attacker-controlled, so they go through env rather than being
-      # interpolated into the script body.
       - name: Context
         env:
-          EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           SHA: ${{ github.sha }}
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
           ACTOR: ${{ github.actor }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          echo "event      : $EVENT"
           echo "ref        : $REF"
           echo "sha        : $SHA"
-          echo "base ref   : ${BASE_REF:-<none>}"
-          echo "head ref   : ${HEAD_REF:-<none>}"
           echo "actor      : $ACTOR"
           echo "run attempt: $RUN_ATTEMPT"
 
-      # --- speculation (workflow_dispatch only) -------------------------------
-      #
       # Reconstructs what SubmitQueue is actually asking CI to test: the base
       # URIs are in-flight changes ahead of this batch in the queue (speculated
       # on, not yet merged), the head URIs are the batch under test. Building
       # both refs and diffing them shows exactly the change this run is
       # responsible for. Build and test below then run against the constructed
       # sq/head tree.
-
+      #
       # Every dispatch input is caller-supplied, so it is passed through env
       # rather than interpolated into the script body — a `${{ }}` expansion
       # inside `run:` would let a crafted value inject shell.
       - name: Parse inputs
-        if: github.event_name == 'workflow_dispatch'
         env:
           SQ_QUEUE: ${{ inputs.sq_queue }}
           SQ_BASE_URIS: ${{ inputs.sq_base_uris }}
@@ -169,7 +136,6 @@ jobs:
           parse head "${SQ_HEAD_URIS:-}" "$RUNNER_TEMP/head.tsv"
 
       - name: Write apply helper
-        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/apply.sh" <<'SCRIPT'
@@ -225,7 +191,6 @@ jobs:
           git config user.email "sq-ci[bot]@users.noreply.github.com"
 
       - name: Build base ref
-        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           git switch --quiet --create sq/base
@@ -234,7 +199,6 @@ jobs:
           echo "sq/base = $(git rev-parse HEAD)"
 
       - name: Build head ref
-        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           git switch --quiet --create sq/head sq/base
@@ -243,7 +207,6 @@ jobs:
           echo "sq/head = $(git rev-parse HEAD)"
 
       - name: Diff base..head
-        if: github.event_name == 'workflow_dispatch'
         env:
           SQ_QUEUE: ${{ inputs.sq_queue }}
         run: |
@@ -290,10 +253,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # --- build and test -----------------------------------------------------
-      #
-      # On a dispatch run the working tree is sq/head, so these exercise the
-      # speculated batch rather than the bare default branch.
+      # The working tree is sq/head, so these exercise the speculated batch.
 
       - name: Build
         run: echo "no-op build — nothing to compile yet"
